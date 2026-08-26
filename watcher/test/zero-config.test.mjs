@@ -153,7 +153,16 @@ function withoutGitIdentity(site) {
 }
 
 function runCli(args, env) {
-  return spawnSync(process.execPath, [CLI_PATH, ...args], { encoding: "utf8", env });
+  // Run from the throwaway HOME, never from the repository. A relative path the
+  // watcher resolves wrongly then lands in a temp directory — and cannot be
+  // committed into the surrounding repo, which is exactly what happened while
+  // the ~ bug was still unfixed: the vault resolved to <repo>/~/…, that path was
+  // inside a git repository, so the watcher dutifully committed it.
+  return spawnSync(process.execPath, [CLI_PATH, ...args], {
+    encoding: "utf8",
+    env,
+    cwd: env.HOME,
+  });
 }
 
 function run() {
@@ -178,6 +187,23 @@ function run() {
       const argv = JSON.parse(readFileSync(site.argvRecord, "utf8"));
       assert.deepEqual(argv.slice(0, 2), ["graph", "export"]);
       assert.equal(argv[argv.indexOf("--graph") + 1], "Demo");
+    } finally {
+      rmSync(site.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a ~ path from the settings panel means home, not a folder called ~", () => {
+    // A shell would expand this; a text field in a settings panel does not, and
+    // resolve() would happily create a literal "~" directory next to the cwd.
+    const site = installation({ settings: { vaultPath: "~/tilde-vault" } });
+    try {
+      const res = runCli(["--once"], site.env);
+      assert.equal(res.status, 0, res.stderr);
+      assert.ok(
+        existsSync(join(site.root, "tilde-vault", "graph.geml")),
+        "expected the vault under HOME"
+      );
+      assert.ok(!existsSync(join(site.root, "~")), "a literal ~ directory must never appear");
     } finally {
       rmSync(site.root, { recursive: true, force: true });
     }
