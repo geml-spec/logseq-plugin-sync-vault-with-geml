@@ -1,6 +1,5 @@
 node_modules/
-dist/
-*.tgz
+out/
 
 # A path that failed to expand: never let one be committed again.
 ~/
