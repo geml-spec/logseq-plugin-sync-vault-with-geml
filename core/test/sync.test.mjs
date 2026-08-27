@@ -13,6 +13,7 @@ import {
   syncEdnToDisk,
   syncDiskToEdn,
   normalizeEol,
+  detectExternalEdits,
 } from "../src/sync-engine.mjs";
 
 let passed = 0;
@@ -199,8 +200,15 @@ async function run() {
         .split("\n")
         .map((l) => l.trim());
 
-      assert.equal(gitDiffLines.length, 1, "Exactly one file should be dirty under git status");
-      assert.ok(gitDiffLines[0].endsWith("pages/page-alpha.geml"), `Expected pages/page-alpha.geml, got ${gitDiffLines[0]}`);
+      // The changed page plus the sync's own ledger, and NOTHING else: the v2
+      // manifest records content hashes, so it legitimately moves whenever a
+      // page does. What must never appear here is an untouched page.
+      const dirty = gitDiffLines.map((l) => l.split(/\s+/).pop()).sort();
+      assert.deepEqual(
+        dirty,
+        [".geml-manifest.json", "pages/page-alpha.geml"],
+        `Expected exactly the edited page and the manifest, got: ${gitDiffLines.join(" | ")}`
+      );
 
       // 4. Test adding a page updates #page-order in graph.geml (Criterion 6)
       execFileSync("git", ["add", "-A"], { cwd: tmp, stdio: "ignore" });
@@ -334,6 +342,102 @@ async function run() {
 
   await test("normalizeEol handles CRLF and lone CR (Issue 9)", () => {
     assert.equal(normalizeEol("a\r\nb\rc\nd"), "a\nb\nc\nd");
+  });
+
+  await test("external edits: the sync's own writes are never someone else's edits", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "geml-extedit-"));
+    try {
+      await syncEdnToDisk(FIXTURE_EDN, tmp);
+      await syncEdnToDisk(FIXTURE_EDN, tmp); // echo: a second identical sync
+      const quiet = detectExternalEdits(tmp);
+      assert.equal(quiet.baselineKnown, true);
+      assert.deepEqual(
+        [quiet.modified, quiet.added, quiet.missing],
+        [[], [], []],
+        "a freshly synced vault must read as untouched"
+      );
+
+      // A person (or agent) edits one synced file: exactly that file reports.
+      const alpha = join(tmp, "pages", "page-alpha.geml");
+      writeFileSync(alpha, readFileSync(alpha, "utf8").replace("First block", "First block, edited outside"));
+      // A user-authored file appears: added, never modified.
+      writeFileSync(join(tmp, "my-note.geml"), "=== text\nmine\n===\n", "utf8");
+
+      const edits = detectExternalEdits(tmp);
+      assert.deepEqual(edits.modified, ["pages/page-alpha.geml"]);
+      assert.deepEqual(edits.added, ["my-note.geml"]);
+      assert.deepEqual(edits.missing, []);
+
+      // The next sync from the graph re-baselines the synced file…
+      await syncEdnToDisk(FIXTURE_EDN, tmp);
+      const after = detectExternalEdits(tmp);
+      assert.deepEqual(after.modified, [], "a re-sync resets the baseline");
+      // …and a synced file deleted from disk reports as missing.
+      rmSync(join(tmp, "pages", "page-beta.geml"));
+      assert.deepEqual(detectExternalEdits(tmp).missing, ["pages/page-beta.geml"]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test("external edits: a v1 manifest knows files but not content — report nothing, not guesses", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "geml-extedit-v1-"));
+    try {
+      await syncEdnToDisk(FIXTURE_EDN, tmp);
+      // Rewrite the manifest in the v1 array shape an older watcher left behind.
+      const paths = Object.keys(JSON.parse(readFileSync(join(tmp, ".geml-manifest.json"), "utf8")).files);
+      writeFileSync(join(tmp, ".geml-manifest.json"), JSON.stringify(paths, null, 1) + "\n");
+
+      const edits = detectExternalEdits(tmp);
+      assert.equal(edits.baselineKnown, false, "v1 has no hashes — no baseline, no claims");
+      assert.deepEqual([edits.modified, edits.added, edits.missing], [[], [], []]);
+
+      // And v1 membership still guards deleteOrphans exactly as before.
+      const files = new Map([["pages/page-alpha.geml", "=== text\nHello\n===\n"]]);
+      const res = writeGemlFilesToDisk(files, tmp, { deleteOrphans: true });
+      assert.ok(res.deleted.includes("pages/page-beta.geml"), "v1-tracked orphan is deletable on request");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await test("two-way primitives: a both-sides change is a conflict, one-side is importable", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "geml-conflict-"));
+    try {
+      await syncEdnToDisk(FIXTURE_EDN, tmp);
+      const alpha = join(tmp, "pages", "page-alpha.geml");
+      const userVersion = readFileSync(alpha, "utf8").replace("First block", "First block, vault edit");
+      writeFileSync(alpha, userVersion);
+
+      // Graph-side maps, explicit: same-as-baseline vs moved since the sync.
+      const baselineAlpha = userVersion.replace("First block, vault edit", "First block");
+      const graphUnmoved = new Map([["pages/page-alpha.geml", baselineAlpha]]);
+      const graphMoved = new Map([["pages/page-alpha.geml", baselineAlpha.replace("First block", "First block, app edit")]]);
+
+      const importable = detectExternalEdits(tmp, { graphFiles: graphUnmoved });
+      assert.deepEqual(importable.modified, ["pages/page-alpha.geml"]);
+      assert.deepEqual(importable.conflicts, []);
+
+      const conflicted = detectExternalEdits(tmp, { graphFiles: graphMoved });
+      assert.deepEqual(conflicted.conflicts, ["pages/page-alpha.geml"]);
+      assert.deepEqual(conflicted.modified, []);
+
+      // preserve: the export must not clobber the person's version, and the
+      // manifest must keep the OLD baseline so the conflict stays visible.
+      const graphState = new Map([["pages/page-alpha.geml", graphMoved.get("pages/page-alpha.geml")]]);
+      const res = writeGemlFilesToDisk(graphState, tmp, { preserve: ["pages/page-alpha.geml"] });
+      assert.deepEqual(res.preserved, ["pages/page-alpha.geml"]);
+      assert.equal(readFileSync(alpha, "utf8"), userVersion, "the person's version stays on disk");
+      const again = detectExternalEdits(tmp, { graphFiles: graphMoved });
+      assert.deepEqual(again.conflicts, ["pages/page-alpha.geml"], "an unresolved conflict keeps reporting");
+
+      // exclude: the import EDN built for the graph leaves the conflict out.
+      const edn = syncDiskToEdn(tmp, lib, { exclude: ["pages/page-alpha.geml"] });
+      assert.ok(!edn.includes("vault edit"), "excluded file's content must not reach the import");
+      assert.ok(edn.includes("Page Beta"), "everything else still does");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   console.log(`\n${passed} sync engine tests passed.`);

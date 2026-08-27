@@ -20,7 +20,8 @@ Two settings, and only the first one usually needs touching:
 - 📦 **A plain-text copy that stays yours** — every page a readable file, not a
   database dump, in a folder you chose
 - 🔁 **Continuous, not one-shot** — edit in Logseq, and seconds later the file
-  on disk has caught up
+  on disk has caught up; with `--two-way`, edit the file and the graph
+  catches up the same way
 - ↩️ **A way back** — `logseq-sync restore` imports the vault into a graph,
   merging by block uuid. Files you can read are worth more when they are also
   files you can return
@@ -150,6 +151,7 @@ found and what is missing, and exits non-zero when the setup cannot sync:
 | `--once` | sync once and exit, instead of watching |
 | `--git-commit` | commit, creating the vault repository if there is none |
 | `--no-git-commit` | never touch git |
+| `--two-way` | also import vault edits back, every cycle — conflicts held, deletions never imported (needs the app CLI) |
 | `--mirror` | delete vault files for pages removed from the graph |
 | `--markdown <dir>` | also write a lossy Markdown copy there, for other tools |
 | `--interval <seconds>` | heartbeat between signals (default 10) |
@@ -199,11 +201,58 @@ reads them back from. *Debounce (seconds)* — quiet
 period after the last change before the watcher is signalled (default 5; syncs
 feed git commits, so this is deliberately calmer than UI-style debounce).
 
+### Editing the vault from outside
+
+The vault is ordinary text, and that is the point: agents, scripts and plain
+`sed` all work on it, and none of them needs to know Logseq exists. With
+`--two-way` running, an edit imports on the next cycle; without it, run
+`logseq-sync restore` when you are ready.
+
+**An agent (Claude, or anything speaking MCP)** gets addressed, validated
+block edits from the [`geml` MCP server](https://github.com/geml-spec/geml):
+
+```sh
+npm i -g @geml/geml
+geml mcp --root <your-vault-dir> --no-history
+```
+
+`--no-history` matters here: git is this vault's history, and without the flag
+every MCP write also saves a `.gemlhistory` sidecar revision beside the file.
+(If you want those too, drop the flag — the sync ignores sidecars either way
+and never commits them.)
+
+**A one-liner** reads or edits one block by its address — every block carries
+its uuid:
+
+```sh
+geml find "that phrase" <vault-dir>              # → pages/foo.geml  #<uuid>
+geml get  <vault-dir>/pages/foo.geml '#<uuid>'
+printf 'new text' | geml set <vault-dir>/pages/foo.geml '#<uuid>' --in - -o <same-file>
+```
+
+**Bulk refactoring** is whatever your shell already does — the result is
+re-imported by uuid, so identity survives the edit:
+
+```sh
+grep -rl "old-tag" <vault-dir>/pages | xargs sed -i 's/old-tag/new-tag/g'
+logseq-sync restore <vault-dir> --yes            # or let --two-way pick it up
+```
+
+A `geml check <file>` after a bulk edit is cheap insurance: it names a mangled
+block before the import carries it into the graph, while the diff is still in
+front of you.
+
 ## Honesty corner
 
-- The **continuous** direction is graph → files. Going back is a deliberate
-  command (`restore`), not a background loop — two live writers over one graph
-  is a merge problem this does not pretend to have solved.
+- The **default** continuous direction is graph → files; going back is a
+  deliberate command (`restore`). `--two-way` makes the return trip continuous
+  too — every cycle imports what changed in the vault — under three rules that
+  say what it does NOT pretend to solve: a file changed on **both** sides
+  since the last sync is a conflict, held exactly as you left it (not
+  imported, not overwritten, named in the toolbar status until you merge it);
+  deletions are **never** imported; and a graph backup is taken before the
+  first import and every tenth after. The sync tells its own writes from
+  yours by content hash, so nothing echoes.
 - Files the sync did not write are never touched: a manifest tracks what it
   owns, and `--mirror` only ever removes files from that list.
 - **The app's lock is the thing to know about.** A running Logseq holds
