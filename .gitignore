@@ -1,5 +1,2 @@
 node_modules/
 out/
-
-# A path that failed to expand: never let one be committed again.
-~/
