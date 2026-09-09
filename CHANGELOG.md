@@ -5,6 +5,34 @@ The plugin (`logseq-plugin-sync-vault-with-geml`) and the watcher
 Logseq major this speaks to — 2.x means Logseq 2.x DB graphs, and nothing
 older.
 
+## v2.3.0
+
+- **A block's uuid has ONE home.** It used to appear twice — as `{#uuid}`, the
+  address, and again inside the `.block-meta` EDN beside it — because
+  losslessness was made not to depend on the id attribute. The effect was that
+  the tool believed the blob: hand-edit `#id` and the change was silently
+  ignored, which is the opposite of the claim this integration makes for GEML.
+  The id is now the only copy and the import reads `:block/uuid` back from it.
+  Only an id that LOOKS like a uuid becomes one, so a hand-written `{#intro}`
+  does not hand Logseq a malformed graph.
+
+- **The EDN in those blocks is laid out to be read.** A block with seven
+  properties came out as one 330-character line. Maps now break one entry per
+  line and nest. Only the whitespace between entries is ours — every key and
+  leaf still goes through the EDN serializer, so nothing can be mis-quoted and
+  no tagged literal is lost.
+
+- **Reaching one property needs a newer parser underneath.** The floor is
+  `@geml/geml` ^1.10.2, and the lockfile pin with it. 1.10.0 reads a `data
+  {format=edn}` body as raw text — one `unknown data format` warning, no value
+  tree — so a coordinate like
+  `#meta-<uuid>[":build/properties"][":user.property/status"]` had nothing to
+  reach into. 1.10.2 parses those bodies, and writes them back as EDN rather
+  than flattening them to JSON.
+
+- `demo/geml/` regenerated. It had been stale since the `level=N` → `.level-N`
+  migration, which never reached it.
+
 ## v2.2.0
 
 **The parser underneath understands `view`.** No plugin or watcher code changed
